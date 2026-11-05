@@ -1,0 +1,114 @@
+# A version tag (vX.Y.Z) builds static Linux binaries from that commit and
+# publishes them as a GitHub release, with SHA256SUMS and build provenance.
+name: Release
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            asset: hydra-linux-amd64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            asset: hydra-linux-arm64
+    runs-on: ${{ matrix.runner }}
+    container: rust:1-slim-bookworm
+    env:
+      # ring (TLS) compiles C; musl-gcc links it statically.
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      CC_aarch64_unknown_linux_musl: musl-gcc
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq musl-tools >/dev/null
+          rustup target add ${{ matrix.target }}
+      - name: The tag matches Cargo.toml's version
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME, Cargo.toml $version"; exit 1; }
+      - name: Test
+        run: cargo test --locked --target ${{ matrix.target }}
+      - name: Build
+        run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Check the binary
+        run: |
+          bin=target/${{ matrix.target }}/release/hydra
+          # Static: no program interpreter, so it runs on any distribution.
+          # (ldd can't tell: it calls a static-pie binary "statically linked"
+          # and exits 0.)
+          if readelf -l "$bin" | grep -q 'program interpreter'; then echo "$bin is dynamically linked"; exit 1; fi
+          "$bin" version | grep -qx "${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          install -m 0755 "$bin" "dist/${{ matrix.asset }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: |
+          chmod 0755 hydra-linux-*
+          sha256sum hydra-linux-* > SHA256SUMS
+          cat SHA256SUMS
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/hydra-linux-*
+      - name: Release notes
+        run: |
+          {
+            git log -1 --format=%B "$GITHUB_SHA" | grep -v '^Source-Commit: '
+            cat <<EOF
+
+          ## Install
+
+          Static builds for Linux on x86_64 (\`amd64\`) and ARM64 (\`arm64\`):
+
+          \`\`\`bash
+          ARCH=\$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
+          curl -fsSLO https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/hydra-linux-\$ARCH
+          curl -fsSLO https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/SHA256SUMS
+          sha256sum --check --ignore-missing SHA256SUMS
+          sudo install -m 0755 hydra-linux-\$ARCH /usr/local/bin/hydra
+          sudo hydra setup
+          \`\`\`
+
+          Each binary carries a build provenance attestation: \`gh attestation verify hydra-linux-\$ARCH --repo $GITHUB_REPOSITORY\` checks that it was built here, from this tag.
+          EOF
+          } | cat -s > notes.md
+          cat notes.md
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
+              --title "hydra ${GITHUB_REF_NAME#v}" --notes-file notes.md --verify-tag
+          fi

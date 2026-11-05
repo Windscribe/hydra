@@ -55,7 +55,26 @@ It works like the first two relays of Tor, but much simpler. It isn't anonymous 
 
 ### 1. Install
 
-Build it with a recent [Rust toolchain](https://rustup.rs):
+Download the latest release for your server, check it, and install it:
+
+```bash
+ARCH=$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
+curl -fsSLO https://github.com/Windscribe/hydra/releases/latest/download/hydra-linux-$ARCH
+curl -fsSLO https://github.com/Windscribe/hydra/releases/latest/download/SHA256SUMS
+sha256sum --check --ignore-missing SHA256SUMS
+sudo install -m 0755 hydra-linux-$ARCH /usr/local/bin/hydra
+```
+
+- The builds are static, so they run on any Linux distribution, on x86_64 (`amd64`) or ARM64 (`arm64`).
+- `sha256sum` should print `hydra-linux-<arch>: OK`. Don't install it if it doesn't.
+- GitHub builds each release from its tagged source. To check that a binary was built there, run `gh attestation verify hydra-linux-$ARCH --repo Windscribe/hydra` (needs the [GitHub CLI](https://cli.github.com)).
+
+Every release is listed on the [Releases page](https://github.com/Windscribe/hydra/releases).
+
+<details>
+<summary>Or build it from source</summary>
+
+With a recent [Rust toolchain](https://rustup.rs):
 
 ```bash
 git clone https://github.com/Windscribe/hydra.git
@@ -63,6 +82,8 @@ cd hydra
 cargo build --release
 sudo install -m 0755 target/release/hydra /usr/local/bin/hydra
 ```
+
+</details>
 
 ### 2. Run the guided setup
 
@@ -150,7 +171,7 @@ Prefer commands to the guided setup? These steps do the same.
 
 3. **Share `hydra.json`**, as in [Sharing the profile](#sharing-the-profile).
 
-4. **Keep it running after a reboot.** hydra saves each entry in `/etc/hydra/entries.json`, but forwarding rules don't survive a reboot on their own. Install the systemd units:
+4. **Keep it running after a reboot.** hydra saves each entry in `/etc/hydra/entries.json`, but forwarding rules don't survive a reboot on their own. The easy way is `sudo hydra setup` → **Keep hydra running after a reboot**: it writes the systemd units for you. To install them by hand from the source's `contrib/` folder:
 
    ```bash
    sudo cp contrib/hydra.service contrib/hydra-refresh.service contrib/hydra-refresh.timer /etc/systemd/system/
