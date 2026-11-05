@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    container: rust:1-slim-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Format, clippy, tests, release build
+        run: sh scripts/check.sh
+
+  audit:
+    runs-on: ubuntu-latest
+    container: rust:1-slim-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Known vulnerabilities in dependencies
+        run: cargo install cargo-audit --locked && cargo audit

@@ -1,0 +1,5 @@
+/target
+/.cargo
+hydra.json
+core
+core.[0-9]*

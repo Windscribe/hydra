@@ -1,0 +1,8 @@
+[Unit]
+Description=hydra: follow Windscribe's changes to each entry's datacenter
+Wants=network-online.target
+After=network-online.target hydra.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/hydra apply --refresh

@@ -1,0 +1,15 @@
+[Unit]
+Description=hydra WireGuard entry relay
+Wants=network-online.target
+After=network-online.target nftables.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/etc/hydra
+ExecStart=/usr/local/bin/hydra apply
+ExecStartPost=-/usr/local/bin/hydra tune --apply
+ExecStop=/usr/local/bin/hydra down
+
+[Install]
+WantedBy=multi-user.target

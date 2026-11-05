@@ -1,0 +1,32 @@
+[package]
+name = "hydra"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Self-hosted WireGuard entry relay for Windscribe"
+repository = "https://github.com/Windscribe/hydra"
+rust-version = "1.85"
+
+[[bin]]
+name = "hydra"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+# hydra setup's arrow-key menus need a raw-mode terminal, which std can't do.
+# Without default features this adds console, libc, shell-words, unicode-width.
+dialoguer = { version = "0.12", default-features = false }
+# console raises SIGINT on Ctrl-C at a menu; dying of it leaves the cursor the
+# menu hid invisible. Adds nix, bitflags, cfg-if.
+ctrlc = "3"
+# IP_TRANSPARENT, to check whether a range is routed to the server (probe.rs). Already
+# in the tree through ctrlc and dialoguer.
+libc = "0.2"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"
