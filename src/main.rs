@@ -28,6 +28,7 @@ mod datacenters;
 mod host;
 mod look;
 mod nft;
+mod ping;
 mod probe;
 mod profile;
 mod setup;
@@ -45,7 +46,7 @@ const USAGE: &str = "hydra - self-hosted WireGuard entry for Windscribe
 Usage:
   hydra setup [--status-url URL] [--wg-zone Z]   guided: add, remove and share
                                                  entries
-  hydra lookup <city|country|name> [--limit N] [--status-url URL] [--wg-zone Z]
+  hydra lookup [city|country|name] [--ping|--best] [--limit N] [--status-url URL] [--wg-zone Z]
   hydra check-range <CIDR> [--status-url URL]
   hydra up [options]
   hydra apply [--refresh] [--no-flowtable] [--dry-run] [--skip-sysctl]
@@ -61,6 +62,8 @@ Every command that reads or changes the host's entries takes
 --state FILE (default /etc/hydra/entries.json).
 
 up options:
+  --best              auto-select the nearest low-load datacenter by probing
+                      latency (combines with --location to narrow the search)
   --location Q        the least-loaded datacenter matching a city, country or
                       name in Windscribe's locations
   --datacenter H      a datacenter by its WireGuard hostname, the one its
@@ -197,7 +200,13 @@ fn run(sys: &Sys, args: &[String]) -> Result<u8, String> {
             sys,
             &Flags::parse(
                 rest,
-                &[("limit", true), ("status-url", true), ("wg-zone", true)],
+                &[
+                    ("limit", true),
+                    ("ping", false),
+                    ("best", false),
+                    ("status-url", true),
+                    ("wg-zone", true),
+                ],
             )?,
         )
         .map(|_| 0),
@@ -221,6 +230,7 @@ fn run(sys: &Sys, args: &[String]) -> Result<u8, String> {
 const SETUP_FLAGS: &[(&str, bool)] = &[("state", true), ("status-url", true), ("wg-zone", true)];
 
 const UP_FLAGS: &[(&str, bool)] = &[
+    ("best", false),
     ("location", true),
     ("datacenter", true),
     ("label", true),
@@ -410,7 +420,48 @@ fn load_datacenters_from(
 
 /// The profile for one new entry, and its datacenter's country code.
 fn build_profile(sys: &Sys, f: &Flags, listen: Ipv4Addr) -> Result<(Profile, String), String> {
-    let d = if let Some(h) = f.get("datacenter") {
+    if f.has("best") && f.get("datacenter").is_some() {
+        return Err("--best cannot be combined with --datacenter".into());
+    }
+    let d = if f.has("best") {
+        let mut dcs = load_datacenters(sys, f)?;
+        if let Some(q) = f.get("location") {
+            dcs = datacenters::filter(dcs, q);
+            if dcs.is_empty() {
+                return Err(format!("no datacenter matched {q:?}"));
+            }
+        }
+        let usable_count = dcs.iter().filter(|d| d.usable).count();
+        let probe_count = if usable_count > 0 {
+            usable_count
+        } else {
+            dcs.len()
+        };
+        eprintln!("probing {probe_count} datacenter(s) for lowest latency and load...");
+        let ranked = ping::rank_datacenters(dcs, ping::DEFAULT_TIMEOUT, |hosts, t| {
+            sys.probe_hosts(hosts, t)
+        });
+        let best = ranked
+            .into_iter()
+            .next()
+            .ok_or_else(|| "no datacenters available".to_string())?;
+        match best.rtt_ms {
+            Some(ms) => eprintln!(
+                "picked {} ({}): {:.1} ms, load {}%",
+                best.dc.label(),
+                best.dc.hostname,
+                ms,
+                best.dc.load
+            ),
+            None => eprintln!(
+                "picked {} ({}): load {}% (ping unavailable)",
+                best.dc.label(),
+                best.dc.hostname,
+                best.dc.load
+            ),
+        }
+        best.dc
+    } else if let Some(h) = f.get("datacenter") {
         let h = h.trim().to_ascii_lowercase();
         if !profile::is_hostname(&h) {
             return Err(format!("--datacenter: {h:?} is not a hostname"));
@@ -427,7 +478,7 @@ fn build_profile(sys: &Sys, f: &Flags, listen: Ipv4Addr) -> Result<(Profile, Str
         eprintln!("picked {} ({}): load {}%", d.label(), d.hostname, d.load);
         d.clone()
     } else {
-        return Err("need --location or --datacenter".into());
+        return Err("need --best, --location, or --datacenter".into());
     };
     let label = f.get("label").map_or_else(|| d.label(), str::to_string);
 
@@ -1162,8 +1213,9 @@ fn cmd_status(f: &Flags) -> Result<(), String> {
 }
 
 fn cmd_lookup(sys: &Sys, f: &Flags) -> Result<(), String> {
-    if f.positional.is_empty() {
-        return Err("usage: hydra lookup <city|country|name>".into());
+    let do_ping = f.has("ping") || f.has("best");
+    if f.positional.is_empty() && !do_ping {
+        return Err("usage: hydra lookup <city|country|name> (or `hydra lookup --ping`)".into());
     }
     let q = f.positional.join(" ");
     let limit: usize = match f.get("limit") {
@@ -1173,6 +1225,43 @@ fn cmd_lookup(sys: &Sys, f: &Flags) -> Result<(), String> {
     let dcs = datacenters::filter(load_datacenters(sys, f)?, &q);
     if dcs.is_empty() {
         return Err(format!("no datacenters matched {q:?}"));
+    }
+    if do_ping {
+        let usable_count = dcs.iter().filter(|d| d.usable).count();
+        let probe_count = if usable_count > 0 {
+            usable_count
+        } else {
+            dcs.len()
+        };
+        eprintln!("probing {probe_count} datacenter(s)...");
+        let ranked = ping::rank_datacenters(dcs, ping::DEFAULT_TIMEOUT, |hosts, t| {
+            sys.probe_hosts(hosts, t)
+        });
+        out!(
+            "{:<30} {:<3} {:<34} {:<6} RTT",
+            "DATACENTER",
+            "CC",
+            "WIREGUARD HOSTNAME",
+            "LOAD"
+        );
+        for r in ranked.iter().take(limit) {
+            let rtt = match r.rtt_ms {
+                Some(ms) => format!("{ms:.1} ms"),
+                None => "timeout".into(),
+            };
+            let drained = if r.dc.usable { "" } else { "  drained" };
+            out!(
+                "{:<30} {:<3} {:<34} {:<6} {rtt}{drained}",
+                r.dc.label(),
+                r.dc.country,
+                r.dc.hostname,
+                format!("{}%", r.dc.load)
+            );
+        }
+        if ranked.len() > limit {
+            out!("... {} more", ranked.len() - limit);
+        }
+        return Ok(());
     }
     out!(
         "{:<30} {:<3} {:<34} LOAD",
@@ -1980,5 +2069,104 @@ mod tests {
             "198.51.100.99:8080"
         );
         assert!(t("198.51.100.99").is_err());
+    }
+
+    #[test]
+    fn up_best_picks_lowest_latency_and_load_datacenter() {
+        use std::time::Duration;
+        let dir = std::env::temp_dir().join(format!("hydra-best-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = dir.join("hydra.json");
+        let state = dir.join("entries.json");
+
+        let status_json = r#"{"data":{"locations":{
+          "1":{"name":"Finland","country_code":"FI","pops":[
+            {"status":1,"datacenter_id":98,"iata_code":"HEL","name":"Helsinki - Sauna","usage":2}]},
+          "2":{"name":"Germany","country_code":"DE","pops":[
+            {"status":1,"datacenter_id":113,"iata_code":"FRA","name":"Frankfurt - Castle","usage":1},
+            {"status":1,"datacenter_id":228,"iata_code":"FRA","name":"Frankfurt - Overloaded","usage":90}]}
+        }}}"#;
+
+        let sys = Sys::fixture(
+            "/nonexistent",
+            Box::new(|cmd, args, _| match cmd {
+                "ip" if args.iter().any(|a| a == "route") => {
+                    Ok(r#"[{"dev":"eth0","prefsrc":"45.33.30.1"}]"#.into())
+                }
+                "ip" => Ok(r#"[{"ifname":"eth0","addr_info":[{"local":"45.33.30.1"}]}]"#.into()),
+                _ => Ok(String::new()),
+            }),
+        )
+        .with_fetcher(move |_| Ok(status_json.into()))
+        .with_hosts(&[
+            ("hel-98-wg.whiskergalaxy.com", &["198.51.100.1"]),
+            ("fra-113-wg.whiskergalaxy.com", &["198.51.100.2"]),
+            ("fra-228-wg.whiskergalaxy.com", &["198.51.100.3"]),
+        ])
+        .with_pinger(|host| match host {
+            "hel-98-wg.whiskergalaxy.com" => Some(Duration::from_millis(1)),
+            "fra-113-wg.whiskergalaxy.com" => Some(Duration::from_millis(30)),
+            "fra-228-wg.whiskergalaxy.com" => Some(Duration::from_millis(1)),
+            _ => None,
+        });
+
+        run(
+            &sys,
+            &s(&[
+                "up",
+                "--best",
+                "--skip-nft",
+                "--skip-sysctl",
+                "--state",
+                state.to_str().unwrap(),
+                "--write",
+                write.to_str().unwrap(),
+            ]),
+        )
+        .unwrap();
+
+        let prof = Profile::load(write.to_str().unwrap()).unwrap();
+        assert_eq!(prof.fronts[0].datacenter, "hel-98-wg.whiskergalaxy.com");
+
+        // Scoped to Germany: should pick fra-113 (30 ms, 1% load) over fra-228 (1 ms, 90% load).
+        run(
+            &sys,
+            &s(&[
+                "up",
+                "--best",
+                "--location",
+                "Germany",
+                "--skip-nft",
+                "--skip-sysctl",
+                "--state",
+                state.to_str().unwrap(),
+                "--write",
+                write.to_str().unwrap(),
+            ]),
+        )
+        .unwrap();
+        let prof = Profile::load(write.to_str().unwrap()).unwrap();
+        assert_eq!(prof.fronts[0].datacenter, "fra-113-wg.whiskergalaxy.com");
+
+        // lookup --ping without a query works cleanly
+        run(&sys, &s(&["lookup", "--ping", "--limit", "2"])).unwrap();
+
+        // --best + --datacenter is rejected
+        let err = run(
+            &sys,
+            &s(&[
+                "up",
+                "--best",
+                "--datacenter",
+                "hel-98-wg.whiskergalaxy.com",
+                "--skip-nft",
+                "--skip-sysctl",
+            ]),
+        )
+        .unwrap_err();
+        assert!(err.contains("cannot be combined"), "{err}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -8,6 +8,7 @@ use crate::audit::{self, Severity};
 use crate::datacenters::{self, Datacenter};
 use crate::host::{self, Range};
 use crate::look::{self, bold, Tone};
+use crate::ping;
 use crate::probe::Delivery;
 use crate::profile::{Front, Profile};
 use crate::state::{Entry, RangeUse, State};
@@ -1012,12 +1013,18 @@ fn datacenters(s: &mut Setup) -> Result<Vec<Datacenter>, String> {
 }
 
 /// The exit: a Windscribe location, then one of its datacenters (asked only
-/// when it has several), or a search by name. `None` when the user backs out.
+/// One datacenter: either auto-selected by latency + load, chosen through its
+/// location (and then its datacenter when it has several), or a search by name.
+/// `None` when the user backs out.
 fn pick_datacenter(s: &mut Setup) -> Result<Option<Datacenter>, String> {
     let all = datacenters(s)?;
     let locations = distinct(all.iter().map(|d| d.location.clone()));
+    let bolt = if s.emoji { "⚡" } else { "  " };
     let glass = if s.emoji { "🔍" } else { "  " };
-    let mut items = vec![format!("{glass} {}", note("Search by name…"))];
+    let mut items = vec![
+        format!("{bolt} {} {}", bold("Best location"), note("(auto-ping)…")),
+        format!("{glass} {}", note("Search by name…")),
+    ];
     items.extend(locations.iter().map(|l| {
         let here: Vec<&Datacenter> = all.iter().filter(|d| &d.location == l).collect();
         let cities = distinct(here.iter().map(|d| d.city.clone()));
@@ -1033,22 +1040,85 @@ fn pick_datacenter(s: &mut Setup) -> Result<Option<Datacenter>, String> {
             load_summary(&here)
         )
     }));
-    let mut default = if locations.is_empty() { 0 } else { 1 };
+    let mut default = 0;
     loop {
         match s.ui.select("Which Windscribe location?", &items, default)? {
             None => return Ok(None),
             Some(0) => {
+                default = 0;
+                if let Some(d) = pick_best(s, &all)? {
+                    return Ok(Some(d));
+                }
+            }
+            Some(1) => {
+                default = 1;
                 if let Some(d) = search(s, &all)? {
                     return Ok(Some(d));
                 }
             }
             Some(i) => {
                 default = i;
-                if let Some(d) = pick_in_location(s, &all, &locations[i - 1])? {
+                if let Some(d) = pick_in_location(s, &all, &locations[i - 2])? {
                     return Ok(Some(d));
                 }
             }
         }
+    }
+}
+
+/// Probes all usable datacenters concurrently and lets the user pick from the
+/// fastest, lowest-load ones (best is highlighted first).
+fn pick_best(s: &mut Setup, all: &[Datacenter]) -> Result<Option<Datacenter>, String> {
+    let usable_count = all.iter().filter(|d| d.usable).count();
+    let probe_count = if usable_count > 0 {
+        usable_count
+    } else {
+        all.len()
+    };
+    s.ui.say(&note(&format!(
+        "Probing {probe_count} datacenters for lowest latency and load…"
+    )));
+    let mut ranked = ping::rank_datacenters(all.to_vec(), ping::DEFAULT_TIMEOUT, |hosts, t| {
+        s.sys.probe_hosts(hosts, t)
+    });
+    if ranked.is_empty() {
+        s.ui.say(&warn("No datacenters available to probe."));
+        return Ok(None);
+    }
+    ranked.truncate(15);
+    let mut items: Vec<String> = ranked
+        .iter()
+        .map(|r| {
+            let d = &r.dc;
+            let flag = flag_prefix(&d.country, s.emoji);
+            let rtt = match r.rtt_ms {
+                Some(ms) => Tone::Green.paint(format!("{ms:>6.1} ms")).to_string(),
+                None => Tone::Yellow.paint("  timeout").to_string(),
+            };
+            let draining = if d.usable {
+                String::new()
+            } else {
+                Tone::Yellow.paint("  draining").to_string()
+            };
+            format!(
+                "{flag}{} {} {} {} {} {}{draining}",
+                bold(format!("{:<16}", d.city)),
+                Tone::Blue.paint(format!("{:<18}", d.nick)),
+                rtt,
+                note("·"),
+                note("load"),
+                look::load(d.load, 3)
+            )
+        })
+        .collect();
+    items.push(note("← Back"));
+    match s.ui.select(
+        "Best Windscribe datacenters (fastest & least loaded first)",
+        &items,
+        0,
+    )? {
+        Some(i) if i < ranked.len() => Ok(Some(ranked.remove(i).dc)),
+        _ => Ok(None),
     }
 }
 
@@ -1655,7 +1725,7 @@ mod tests {
             Pick(0), // the first address
             Yes,     // not public: use it anyway
             Enter,   // port 443
-            Enter,   // the first location: Canada East
+            Pick(2), // the first location: Canada East
             Pick(1), // Toronto, after Montreal (load 4%)
             Enter,   // profile in the working directory
             Enter,   // start forwarding
@@ -1716,9 +1786,9 @@ mod tests {
             Pick(0),
             Yes,
             Enter,
-            Pick(1), // Canada East: two datacenters
+            Pick(2), // Canada East: two datacenters
             Esc,     // back to the locations
-            Pick(1),
+            Pick(2),
             Enter, // Montreal, the least loaded
             Enter,
             Enter,
@@ -1746,7 +1816,7 @@ mod tests {
             Pick(0),
             Yes,
             Enter,
-            Pick(2), // Germany: Frankfurt is its only datacenter
+            Pick(3), // Germany: Frankfurt is its only datacenter
             Enter,
             Enter,
             Enter,
@@ -1767,10 +1837,10 @@ mod tests {
             Pick(0),
             Yes,
             Enter,
-            Pick(0), // search by name
+            Pick(1), // search by name
             txt("atlantis"),
             txt(""), // back to the locations
-            Pick(0),
+            Pick(1),
             txt("old port"),
             Enter, // Montreal · Old Port
             Enter,
@@ -1793,7 +1863,7 @@ mod tests {
             Pick(0),
             Yes,
             Enter,
-            Pick(2), // Germany
+            Pick(3), // Germany
             Esc,     // back on the mapping screen: leave
         ]);
         setup(&l, &mut ui).unwrap();
@@ -1811,14 +1881,14 @@ mod tests {
             Pick(0),
             Yes,
             Enter,
-            Enter,
+            Pick(2),
             Pick(1), // 203.0.113.5 -> Toronto
             Enter,
             Enter,
             Pick(1), // back on the mapping screen: 203.0.113.6
             Yes,
             Enter,
-            Pick(2), // -> Frankfurt
+            Pick(3), // -> Frankfurt
             Enter,
             Enter,
             Enter, // Done
@@ -1851,7 +1921,7 @@ mod tests {
         let mut ui = Script::new(vec![
             Enter, // the default: 93.184.216.34, the free public one
             Enter,
-            Pick(2),
+            Pick(3),
             Enter,
             Enter,
             Enter, // Done: no public address is free any more
@@ -1876,7 +1946,7 @@ mod tests {
             Yes,               // use it anyway
             Pick(1),           // arrives on 10.0.0.6
             Enter,
-            Pick(2),
+            Pick(3),
             Enter,
             Enter,
             Enter, // Done
@@ -1912,7 +1982,7 @@ mod tests {
                     txt("443"),
                     No,    // taken: don't replace
                     Enter, // the free default, 8443
-                    Pick(2),
+                    Pick(3),
                     Enter,
                     Enter,
                     Enter, // Done
@@ -1937,14 +2007,14 @@ mod tests {
             Pick(0),
             Yes,
             Enter,
-            Enter,
+            Pick(2),
             Pick(1),
             Enter,
             Enter,
             Pick(1),
             Yes,
             Enter,
-            Pick(2),
+            Pick(3),
             Enter,
             Enter,
             Enter,
@@ -2245,14 +2315,14 @@ mod tests {
             txt("45.33.31.7"),
             txt("45.33.30.7"),
             Enter,   // port 443
-            Enter,   // Canada East
+            Pick(2), // Canada East
             Pick(1), // Toronto
             Enter,
             Enter,   // start forwarding
             Pick(3), // the /24 again: not asked about twice
             Enter,   // its first free address, 45.33.30.1
             Enter,
-            Pick(2), // Germany: Frankfurt
+            Pick(3), // Germany: Frankfurt
             Enter,
             Enter,
             Pick(5), // Done
@@ -2301,7 +2371,7 @@ mod tests {
             Enter, // hold each address
             Enter, // 45.33.20.194: .193 is the server's, .192 the network
             Enter,
-            Pick(2), // Germany
+            Pick(3), // Germany
             Enter,
             Enter,
             Pick(5), // Done
@@ -2330,7 +2400,7 @@ mod tests {
             Pick(1), // the provider routes it here
             Enter,   // 45.33.30.1
             Enter,
-            Pick(2),
+            Pick(3),
             Enter,
             Enter,
             Pick(5),
@@ -2359,6 +2429,36 @@ mod tests {
         setup(&l, &mut ui).unwrap();
         assert!(!Path::new(&l.state).exists());
         assert!(last_nft(&l).is_empty());
+        std::fs::remove_dir_all(&l.dir).unwrap();
+    }
+
+    #[test]
+    fn best_location_probes_and_picks_fastest_datacenter() {
+        use std::time::Duration;
+        let mut l = lab("best-menu", &["203.0.113.5"]);
+        l.sys = l.sys.with_pinger(|host| match host {
+            "fra-3-wg.example.com" => Some(Duration::from_millis(2)),
+            "yul-2-wg.example.com" => Some(Duration::from_millis(80)),
+            "yyz-1-wg.example.com" => Some(Duration::from_millis(90)),
+            _ => None,
+        });
+        let mut ui = Script::new(vec![
+            Pick(0), // address
+            Yes,     // use non-public
+            Enter,   // port 443
+            Enter,   // default: Best location (auto-ping)…
+            Enter,   // first ranked: Frankfurt (2.0 ms)
+            Enter,   // frankfurt.json
+            Enter,   // start forwarding
+            Enter,   // Done
+            Pick(5), // Quit
+        ]);
+        setup_with(&l, &mut ui, true).unwrap();
+
+        assert!(ui.saw("⚡ Best location (auto-ping)…"));
+        assert!(ui.saw("2.0 ms"));
+        let st = State::load(&l.state).unwrap();
+        assert_eq!(st.entries[0].front().datacenter, "fra-3-wg.example.com");
         std::fs::remove_dir_all(&l.dir).unwrap();
     }
 

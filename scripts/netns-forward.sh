@@ -341,20 +341,21 @@ dns lab-22-wg.example.com 198.51.100.10
 # The mapping screen lists 203.0.113.1, 203.0.113.3, 198.51.100.1, "a public IP
 # this server doesn't show", then Done. The cursor starts on the public-IP
 # option (none is public), and on Done once something is mapped; Down wraps.
-# The location menu starts on Lab, the only location; its two datacenters are
+# The location menu starts on "Best location (auto-ping)…", followed by
+# "Search by name…", then Lab, the only location; its two datacenters are
 # listed least loaded first: Bench, then Pier. Keys: \u001b[B is Down, \r Enter.
 steps='[
   ["Map which address to a Windscribe location?", "\u001b[B\u001b[B\r"],
   ["Use it anyway?", "y"],
   ["Which UDP port?", "\r"],
-  ["Which Windscribe location?", "\r"],
+  ["Which Windscribe location?", "\u001b[B\u001b[B\r"],
   ["Which datacenter in Lab?", "\r"],
   ["Write the profile to", "\r"],
   ["Start forwarding?", "\r"],
   ["Map which address to a Windscribe location?", "\u001b[B\u001b[B\r"],
   ["Use it anyway?", "y"],
   ["Which UDP port?", "\r"],
-  ["Which Windscribe location?", "\r"],
+  ["Which Windscribe location?", "\u001b[B\u001b[B\r"],
   ["Which datacenter in Lab?", "\u001b[B\r"],
   ["Write the profile to", "lab-1.json\r"],
   ["Start forwarding?", "\r"],

@@ -4,11 +4,13 @@ use std::io::Write as _;
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4, ToSocketAddrs as _};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 type Runner = Box<dyn Fn(&str, &[String], Option<&str>) -> Result<String, String>>;
 type Resolver = Box<dyn Fn(&str) -> Result<Vec<Ipv4Addr>, String>>;
 type Fetcher = Box<dyn Fn(&str) -> Result<String, String>>;
 type Connector = Box<dyn Fn(Option<Ipv4Addr>, SocketAddrV4) -> Result<(), String>>;
+type Pinger = Box<dyn Fn(&[String], Duration) -> Vec<Option<Duration>>>;
 
 pub struct Sys {
     root: PathBuf,
@@ -16,6 +18,7 @@ pub struct Sys {
     resolver: Resolver,
     fetcher: Fetcher,
     connector: Connector,
+    pinger: Pinger,
 }
 
 impl Sys {
@@ -26,6 +29,7 @@ impl Sys {
             resolver: Box::new(resolve_system),
             fetcher: Box::new(crate::datacenters::fetch),
             connector: Box::new(crate::probe::connect),
+            pinger: Box::new(crate::ping::probe_hosts),
         }
     }
 
@@ -37,6 +41,7 @@ impl Sys {
             resolver: Box::new(|host| Err(format!("{host}: no DNS in tests"))),
             fetcher: Box::new(|url| Err(format!("{url}: no network in tests"))),
             connector: Box::new(|_, to| Err(format!("{to}: no network in tests"))),
+            pinger: Box::new(|hosts, _| vec![None; hosts.len()]),
         }
     }
 
@@ -90,6 +95,18 @@ impl Sys {
     ) -> Self {
         self.connector = Box::new(connector);
         self
+    }
+
+    /// Answers `probe_hosts` with `pinger` instead of the network.
+    #[cfg(test)]
+    pub fn with_pinger(mut self, pinger: impl Fn(&str) -> Option<Duration> + 'static) -> Self {
+        self.pinger = Box::new(move |hosts, _| hosts.iter().map(|h| pinger(h)).collect());
+        self
+    }
+
+    /// Measures round-trip latency to each hostname concurrently.
+    pub fn probe_hosts(&self, hosts: &[String], timeout: Duration) -> Vec<Option<Duration>> {
+        (self.pinger)(hosts, timeout)
     }
 
     /// The body at `url`: Windscribe's locations.
