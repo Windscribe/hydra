@@ -12,8 +12,8 @@ use crate::probe::Delivery;
 use crate::profile::{Front, Profile};
 use crate::state::{Entry, RangeUse, State};
 use crate::sys::Sys;
-use dialoguer::console::Term;
-use dialoguer::theme::ColorfulTheme;
+use dialoguer::console::{measure_text_width, Term};
+use dialoguer::theme::{ColorfulTheme, Theme};
 use dialoguer::{Confirm, Input, Select};
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
@@ -97,6 +97,60 @@ fn stopped(e: dialoguer::Error) -> String {
     format!("setup stopped ({e})")
 }
 
+/// Keeps dialoguer's line-wrap accounting accurate for ANSI-styled items.
+///
+/// `dialoguer::Select` measures each item with `str::len()` (raw bytes,
+/// including ANSI escape codes), so coloured items look wider than the
+/// terminal and `clear_preserve_prompt` erases extra lines above the menu on
+/// every arrow press. Passing ASCII keys padded to `measure_text_width` gives
+/// `Select` the real display width while this wrapper renders the styled text.
+struct StyledSelectTheme<'a> {
+    inner: &'a ColorfulTheme,
+    items: &'a [String],
+}
+
+impl StyledSelectTheme<'_> {
+    fn resolve<'a>(&'a self, key: &'a str) -> &'a str {
+        key.trim()
+            .parse::<usize>()
+            .ok()
+            .and_then(|i| self.items.get(i))
+            .map(String::as_str)
+            .unwrap_or(key)
+    }
+}
+
+impl Theme for StyledSelectTheme<'_> {
+    fn format_select_prompt(&self, f: &mut dyn std::fmt::Write, prompt: &str) -> std::fmt::Result {
+        self.inner.format_select_prompt(f, prompt)
+    }
+
+    fn format_select_prompt_item(
+        &self,
+        f: &mut dyn std::fmt::Write,
+        text: &str,
+        active: bool,
+    ) -> std::fmt::Result {
+        self.inner
+            .format_select_prompt_item(f, self.resolve(text), active)
+    }
+
+    fn format_select_prompt_selection(
+        &self,
+        f: &mut dyn std::fmt::Write,
+        prompt: &str,
+        sel: &str,
+    ) -> std::fmt::Result {
+        self.inner
+            .format_select_prompt_selection(f, prompt, self.resolve(sel))
+    }
+}
+
+fn select_key(index: usize, styled: &str) -> String {
+    let width = measure_text_width(styled);
+    format!("{index:<width$}")
+}
+
 impl Ui for Terminal {
     fn say(&mut self, text: &str) {
         eprintln!("{text}");
@@ -109,9 +163,18 @@ impl Ui for Terminal {
         default: usize,
     ) -> Result<Option<usize>, String> {
         not_interrupted()?;
-        Select::with_theme(&self.theme)
+        let keys: Vec<String> = items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| select_key(i, item))
+            .collect();
+        let theme = StyledSelectTheme {
+            inner: &self.theme,
+            items,
+        };
+        Select::with_theme(&theme)
             .with_prompt(prompt)
-            .items(items)
+            .items(&keys)
             .default(default)
             .max_length(15)
             .interact_opt()
@@ -2360,6 +2423,33 @@ mod tests {
         assert!(!Path::new(&l.state).exists());
         assert!(last_nft(&l).is_empty());
         std::fs::remove_dir_all(&l.dir).unwrap();
+    }
+
+    #[test]
+    fn styled_select_keys_match_display_width_and_render_original_items() {
+        let styled = format!(
+            "\x1b[1m{:<16}\x1b[0m \x1b[38;2;137;143;157meth0    \x1b[0m \x1b[38;2;59;255;239m:443\x1b[0m \x1b[38;2;59;255;239m→\x1b[0m 🇫🇮 \x1b[38;2;193;231;237mHelsinki · Sauna\x1b[0m",
+            "91.107.185.161"
+        );
+        let key = select_key(0, &styled);
+        assert!(styled.len() > 100, "raw bytes include ANSI escapes");
+        assert_eq!(key.len(), measure_text_width(&styled));
+        assert!(key.is_ascii());
+
+        let base = look::theme();
+        let items = vec![styled.clone()];
+        let wrapped = StyledSelectTheme {
+            inner: &base,
+            items: &items,
+        };
+        let mut expected = String::new();
+        let mut actual = String::new();
+        base.format_select_prompt_item(&mut expected, &styled, true)
+            .unwrap();
+        wrapped
+            .format_select_prompt_item(&mut actual, &key, true)
+            .unwrap();
+        assert_eq!(actual, expected);
     }
 
     #[test]
